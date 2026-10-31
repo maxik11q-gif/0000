@@ -1,0 +1,1159 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0908">
+<title>Чекушка-Змейка</title>
+<style>
+  html, body {margin:0; padding:0; height:100%; background:#0b0908; overflow:hidden;}
+  body {display:flex; align-items:center; justify-content:center; touch-action:none;
+        -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent;}
+  canvas {display:block; max-width:100%; max-height:100%; touch-action:none;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+/* ---------- размеры и цвета (как в Python-версии) ---------- */
+const W = 1164, H = 688, CELL = 26, COLS = 30, ROWS = 22;
+const PAD = 20, HEADER = 96, PW = 320, GAP = 24;
+const BX = PAD, BY = HEADER, BW = COLS * CELL, BH = ROWS * CELL;
+const PX = BX + BW + GAP, PY = HEADER, PH = BH;
+
+const COL = {
+  bgTop: '#17120f', bgBot: '#0b0908',
+  board: '#1b1612', board2: '#171310',
+  grid: 'rgba(58,48,40,0.55)', edge: '#3e3024', panel: '#191411', panelEdge: '#3a2e24',
+  text: '#f0e7d9', dim: '#9c8a76', faint: '#685c4e',
+  gold: '#e9b556', goldDark: '#9c722c', green: '#68c674',
+  p1: '#96e25c', p1d: '#4c8028', p2: '#56bef5', p2d: '#245c84',
+  red: '#e85c5c', snow: '#f6f6f0'
+};
+
+const RULES = {
+  soloSpeed: 7.5, duoSpeed: 8.5, speedStep: 0.28, speedMax: 15.0,
+  grow: 1, growDouble: 2, points: 1, pointsDouble: 3, doubleChance: 0.22,
+  winsNeeded: 3, countdown: 1.6, roundPause: 2.4
+};
+
+/* ---------- канвас ---------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const DPR = Math.min(2, window.devicePixelRatio || 1);
+canvas.width = Math.round(W * DPR);
+canvas.height = Math.round(H * DPR);
+ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+/* ---------- мелкие помощники ---------- */
+function rrect(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function font(sz, bold) { return (bold ? 'bold ' : '') + sz + 'px "Segoe UI", Arial, sans-serif'; }
+function text(str, x, y, sz, color, bold, align) {
+  ctx.font = font(sz, bold);
+  ctx.fillStyle = color;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillText(str, x, y);
+}
+function centerText(str, x, y, sz, color, bold) {
+  ctx.font = font(sz, bold);
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(str, x, y);
+}
+function shade(hex, k) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, Math.round(((n >> 16) & 255) * k));
+  const g = Math.min(255, Math.round(((n >> 8) & 255) * k));
+  const b = Math.min(255, Math.round((n & 255) * k));
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+function rgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+}
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+/* ---------- фон (кэшируется) ---------- */
+const bgCanvas = document.createElement('canvas');
+bgCanvas.width = W; bgCanvas.height = H;
+(function buildBg() {
+  const b = bgCanvas.getContext('2d');
+  const g = b.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, COL.bgTop);
+  g.addColorStop(1, COL.bgBot);
+  b.fillStyle = g;
+  b.fillRect(0, 0, W, H);
+
+  const rad = b.createRadialGradient(W / 2, -160, 40, W / 2, -160, 620);
+  rad.addColorStop(0, 'rgba(255,190,120,0.10)');
+  rad.addColorStop(1, 'rgba(255,190,120,0)');
+  b.fillStyle = rad;
+  b.fillRect(0, 0, W, H);
+
+  const vig = b.createRadialGradient(W / 2, H / 2, H * 0.25, W / 2, H / 2, H * 0.95);
+  vig.addColorStop(0, 'rgba(0,0,0,0)');
+  vig.addColorStop(1, 'rgba(0,0,0,0.72)');
+  b.fillStyle = vig;
+  b.fillRect(0, 0, W, H);
+})();
+
+/* ---------- звук (WebAudio, без файлов) ---------- */
+let audioCtx = null, soundOn = true;
+function audioInit() {
+  if (audioCtx) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+  } catch (e) { audioCtx = null; }
+}
+function beep(f0, f1, dur, type, vol) {
+  if (!soundOn) return;
+  audioInit();
+  if (!audioCtx) return;
+  try {
+    const t0 = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.setValueAtTime(f0, t0);
+    osc.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t0 + dur);
+    gain.gain.setValueAtTime(vol || 0.12, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  } catch (e) { /* без звука живём */ }
+}
+const sfx = {
+  eat() { beep(300, 620, 0.11, 'sine', 0.10); },
+  gold() { beep(520, 900, 0.16, 'triangle', 0.12); },
+  die() { beep(300, 60, 0.45, 'sawtooth', 0.10); },
+  click() { beep(1200, 900, 0.04, 'square', 0.05); },
+  go() { beep(520, 780, 0.14, 'sine', 0.10); },
+  win() { beep(660, 990, 0.25, 'triangle', 0.12); }
+};
+
+/* ---------- состояние ---------- */
+const state = {
+  scene: 'menu',          // menu | help | play
+  menuIndex: 0,
+  menuItems: ['Один', 'Вдвоём', 'Как играть', 'Звук: вкл'],
+  paused: false,
+  touch: ('ontouchstart' in window) || navigator.maxTouchPoints > 0,
+  best: 0,
+  match: null,
+  buttons: {},
+  pads: [],
+  t: 0,
+  fatal: ''
+};
+try { state.best = parseInt(localStorage.getItem('chekushka_best') || '0', 10) || 0; } catch (e) {}
+
+const DIRS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+const KEYS = {
+  ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+  KeyW: 'up', KeyS: 'down', KeyA: 'left', KeyD: 'right'
+};
+
+/* ---------- партия ---------- */
+function makeSnake(name, color, cells, dir) {
+  return { name: name, color: color, cells: cells, dir: dir, queue: [], alive: true,
+           score: 0, drinks: 0, prev: cells.map(function (p) { return [p[0], p[1]]; }) };
+}
+
+function newMatch(mode) {
+  const m = {
+    mode: mode, snakes: [], food: [], status: 'countdown', countdown: RULES.countdown,
+    timer: 0, winner: null, reason: '', wins: [0, 0], speed: mode === 'duo' ? RULES.duoSpeed : RULES.soloSpeed,
+    acc: 0, alpha: 1, tick: 0, shake: 0, parts: [], floats: [], round: 1, deadAt: 0
+  };
+  startRound(m);
+  return m;
+}
+
+function startRound(m) {
+  m.snakes = [];
+  m.food = [];
+  m.status = 'countdown';
+  m.countdown = RULES.countdown;
+  m.timer = 0;
+  m.acc = 0;
+  m.alpha = 1;
+  m.tick = 0;
+  m.winner = null;
+  m.reason = '';
+  m.parts = [];
+  m.floats = [];
+  m.round++;
+
+  const midRow = Math.floor(ROWS / 2);
+  if (m.mode === 'solo') {
+    const x = Math.floor(COLS / 3);
+    const cells = [];
+    for (let i = 0; i < 4; i++) cells.push([x - i, midRow]);
+    m.snakes.push(makeSnake('Игрок', COL.p1, cells, DIRS.right));
+  } else {
+    const a = [], b = [];
+    for (let i = 0; i < 4; i++) a.push([4 - i, midRow - 3]);
+    for (let i = 0; i < 4; i++) b.push([COLS - 5 + i, midRow + 3]);
+    m.snakes.push(makeSnake('Игрок 1', COL.p1, a, DIRS.right));
+    m.snakes.push(makeSnake('Игрок 2', COL.p2, b, DIRS.left));
+  }
+  const target = m.mode === 'duo' ? 2 : 1;
+  for (let i = 0; i < target; i++) spawnFood(m);
+}
+
+function occupied(m) {
+  const set = {};
+  m.snakes.forEach(function (s) { s.cells.forEach(function (c) { set[c[0] + ',' + c[1]] = 1; }); });
+  m.food.forEach(function (f) { set[f.x + ',' + f.y] = 1; });
+  return set;
+}
+
+function spawnFood(m) {
+  const busy = occupied(m);
+  const free = [];
+  for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+    if (!busy[x + ',' + y]) free.push([x, y]);
+  }
+  if (!free.length) return;
+  const p = free[Math.floor(Math.random() * free.length)];
+  m.food.push({ x: p[0], y: p[1], dbl: Math.random() < RULES.doubleChance, born: state.t });
+}
+
+function turnSnake(s, dir) {
+  if (!s || !s.alive) return;
+  const last = s.queue.length ? s.queue[s.queue.length - 1] : s.dir;
+  if ((dir[0] === last[0] && dir[1] === last[1]) ||
+      (dir[0] === -last[0] && dir[1] === -last[1])) return;
+  if (s.queue.length < 2) s.queue.push(dir);
+}
+
+function speedOf(m) {
+  let drinks = 0;
+  m.snakes.forEach(function (s) { drinks = Math.max(drinks, s.drinks); });
+  const base = m.mode === 'duo' ? RULES.duoSpeed : RULES.soloSpeed;
+  return Math.min(RULES.speedMax, base + drinks * RULES.speedStep);
+}
+
+function stepBoard(m) {
+  m.tick++;
+  const alive = m.snakes.filter(function (s) { return s.alive; });
+  if (!alive.length) return;
+
+  const heads = {}, grows = {};
+  alive.forEach(function (s) {
+    s.prev = s.cells.map(function (c) { return [c[0], c[1]]; });
+    if (s.queue.length) s.dir = s.queue.shift();
+    heads[s.name] = [s.cells[0][0] + s.dir[0], s.cells[0][1] + s.dir[1]];
+  });
+  alive.forEach(function (s) {
+    const h = heads[s.name];
+    grows[s.name] = m.food.some(function (f) { return f.x === h[0] && f.y === h[1]; });
+  });
+
+  const blocking = {};
+  alive.forEach(function (s) {
+    const body = grows[s.name] ? s.cells : s.cells.slice(0, -1);
+    body.forEach(function (c) { blocking[c[0] + ',' + c[1]] = 1; });
+  });
+
+  const dead = [];
+  alive.forEach(function (s) {
+    const h = heads[s.name];
+    if (h[0] < 0 || h[1] < 0 || h[0] >= COLS || h[1] >= ROWS) { s.reason = 'wall'; dead.push(s); return; }
+    if (blocking[h[0] + ',' + h[1]]) {
+      const own = s.cells.some(function (c) { return c[0] === h[0] && c[1] === h[1]; });
+      s.reason = own ? 'self' : 'enemy';
+      dead.push(s);
+    }
+  });
+
+  for (let i = 0; i < alive.length; i++) {
+    const a = alive[i];
+    if (dead.indexOf(a) >= 0) continue;
+    for (let j = i + 1; j < alive.length; j++) {
+      const b = alive[j];
+      if (dead.indexOf(b) >= 0) continue;
+      const ha = heads[a.name], hb = heads[b.name];
+      if (ha[0] === hb[0] && ha[1] === hb[1]) {
+        a.reason = 'head'; b.reason = 'head';
+        dead.push(a, b);
+      }
+    }
+  }
+
+  dead.forEach(function (s) {
+    s.alive = false;
+    sfx.die();
+    burst(m, s.cells[0][0], s.cells[0][1], s.color, 26, 260);
+    m.shake = Math.min(14, m.shake + 9);
+  });
+
+  alive.forEach(function (s) {
+    if (!s.alive) return;
+    const h = heads[s.name];
+    s.cells.unshift([h[0], h[1]]);
+    if (grows[s.name]) {
+      let idx = -1;
+      for (let i = 0; i < m.food.length; i++) {
+        if (m.food[i].x === h[0] && m.food[i].y === h[1]) { idx = i; break; }
+      }
+      const food = idx >= 0 ? m.food.splice(idx, 1)[0] : null;
+      if (!food) { s.cells.pop(); return; }
+      s.drinks++;
+      const gain = food.dbl ? RULES.pointsDouble : RULES.points;
+      s.score += gain;
+      const extra = food.dbl ? RULES.growDouble - 1 : 0;
+      for (let k = 0; k < extra; k++) s.cells.push(s.cells[s.cells.length - 1].slice());
+      burst(m, h[0], h[1], s.color, food.dbl ? 16 : 10, food.dbl ? 230 : 150);
+      m.floats.push({ x: h[0], y: h[1], text: '+' + gain, color: shade(s.color, 1.2), life: 0.95, max: 0.95 });
+      food.dbl ? sfx.gold() : sfx.eat();
+    } else {
+      s.cells.pop();
+    }
+  });
+
+  const target = m.mode === 'duo' ? 2 : 1;
+  while (m.food.length < target) spawnFood(m);
+
+  checkEnd(m);
+}
+
+function checkEnd(m) {
+  const alive = m.snakes.filter(function (s) { return s.alive; });
+  if (m.mode === 'solo') {
+    if (!alive.length) finishRound(m, null, m.snakes[0].reason || 'wall');
+  } else if (alive.length <= 1) {
+    const winner = alive.length ? m.snakes.indexOf(alive[0]) : null;
+    const dead = m.snakes.filter(function (s) { return !s.alive; });
+    finishRound(m, winner, dead.length ? dead[dead.length - 1].reason : '');
+  }
+}
+
+function finishRound(m, winner, reason) {
+  m.status = 'round_over';
+  m.winner = winner;
+  m.reason = reason || '';
+  m.timer = RULES.roundPause;
+  if (m.mode !== 'solo' && winner !== null) {
+    m.wins[winner]++;
+    if (m.wins[winner] >= RULES.winsNeeded) {
+      m.status = 'match_over';
+      sfx.win();
+    }
+  }
+  if (m.mode === 'solo') {
+    if (m.snakes[0].score > state.best) {
+      state.best = m.snakes[0].score;
+      try { localStorage.setItem('chekushka_best', String(state.best)); } catch (e) {}
+    }
+  }
+}
+
+function burst(m, cx, cy, color, count, power) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = power * (0.35 + Math.random() * 0.65);
+    m.parts.push({
+      x: cx + 0.5, y: cy + 0.5,
+      vx: Math.cos(a) * sp / CELL, vy: Math.sin(a) * sp / CELL,
+      life: 0.35 + Math.random() * 0.45, max: 0.8,
+      size: 1.5 + Math.random() * 2.5, color: color
+    });
+  }
+}
+
+function updateMatch(m, dt) {
+  m.alpha = clamp(m.alpha, 0, 1);
+  m.shake = Math.max(0, m.shake - dt * 26);
+
+  m.parts.forEach(function (p) {
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 300 / CELL * dt;
+    p.vx *= 0.99;
+  });
+  m.parts = m.parts.filter(function (p) { return p.life > 0; });
+
+  m.floats.forEach(function (f) {
+    f.life -= dt;
+    f.y -= dt * 1.1;
+  });
+  m.floats = m.floats.filter(function (f) { return f.life > 0; });
+
+  if (m.status === 'countdown') {
+    m.countdown -= dt;
+    if (m.countdown <= 0) { m.status = 'playing'; m.acc = 0; sfx.go(); }
+    return;
+  }
+  if (m.status === 'playing') {
+    m.speed = speedOf(m);
+    m.acc += dt;
+    let steps = 0;
+    while (m.acc >= 1 / m.speed && steps < 4 && m.status === 'playing') {
+      m.acc -= 1 / m.speed;
+      steps++;
+      m.alpha = 0;
+      stepBoard(m);
+    }
+    if (m.status === 'playing') m.alpha = clamp(m.acc * m.speed, 0, 1);
+    return;
+  }
+  if (m.status === 'round_over') {
+    m.timer -= dt;
+    if (m.timer <= 0 && m.mode !== 'solo') startRound(m);
+  }
+}
+
+/* ---------- рисование: бутылка ---------- */
+function bottle(cx, cy, h, dbl, t) {
+  const w = h * 0.27;
+  const capH = h * 0.09, neckH = h * 0.17, neckW = w * 0.34;
+  const top = cy - h / 2, bottom = cy + h / 2;
+  const neckTop = top + capH;
+  const bodyTop = neckTop + neckH - h * 0.02;
+  const bodyH = bottom - bodyTop;
+
+  if (h > 24) {
+    const g = ctx.createRadialGradient(cx, cy, h * 0.05, cx, cy, h * 0.8);
+    const pulse = 0.8 + 0.2 * Math.sin(t * 3);
+    g.addColorStop(0, dbl ? 'rgba(255,214,120,' + (0.30 * pulse) + ')' : 'rgba(120,240,150,' + (0.16 * pulse) + ')');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(cx, cy, h * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(cx, bottom - h * 0.02, w * 0.85, h * 0.055, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  const glass = dbl ? '#c4963e' : '#4e9860';
+  const dark = shade(glass, 0.6);
+
+  rrect(cx - w / 2 - 1, bodyTop, w + 2, bodyH, w * 0.22);
+  ctx.fillStyle = dark;
+  ctx.fill();
+  rrect(cx - w / 2, bodyTop + 1, w, bodyH - 1, w * 0.21);
+  ctx.fillStyle = glass;
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.ellipse(cx, bodyTop + 1, w / 2, w * 0.23, 0, 0, Math.PI * 2);
+  ctx.fillStyle = glass;
+  ctx.fill();
+
+  ctx.fillStyle = dark;
+  ctx.fillRect(cx - neckW / 2 - 1, neckTop, neckW + 2, neckH);
+  ctx.fillStyle = glass;
+  ctx.fillRect(cx - neckW / 2, neckTop, neckW, neckH);
+
+  const capW = neckW * 1.45;
+  ctx.fillStyle = dbl ? '#e9b556' : '#d2b47e';
+  rrect(cx - capW / 2, top, capW, capH, Math.max(1, h * 0.02));
+  ctx.fill();
+
+  const labelH = bodyH * 0.34;
+  const labelY = bodyTop + bodyH * 0.42;
+  ctx.fillStyle = '#eadec6';
+  rrect(cx - w * 0.46, labelY, w * 0.92, labelH, 1);
+  ctx.fill();
+  if (h > 44) {
+    ctx.fillStyle = '#a83c3c';
+    ctx.fillRect(cx - w * 0.40, labelY + labelH - 3, w * 0.80, 1.5);
+    centerText(dbl ? '1,0' : '0,5', cx, labelY + labelH * 0.45, Math.round(labelH * 0.62), '#9a3a3a', true);
+  }
+
+  if (w > 6) {
+    ctx.fillStyle = 'rgba(255,255,255,0.16)';
+    ctx.fillRect(cx - w * 0.34, bodyTop + bodyH * 0.12, Math.max(1, w * 0.12), bodyH * 0.6);
+  }
+}
+
+/* ---------- рисование: змейка ---------- */
+function snakePoints(s, alpha) {
+  const pts = [];
+  for (let i = 0; i < s.cells.length; i++) {
+    const c = s.cells[i];
+    let px = c[0], py = c[1];
+    const pv = s.prev[i] || s.prev[s.prev.length - 1];
+    if (pv && Math.abs(px - pv[0]) <= 1 && Math.abs(py - pv[1]) <= 1) {
+      px = pv[0] + (px - pv[0]) * alpha;
+      py = pv[1] + (py - pv[1]) * alpha;
+    }
+    pts.push([BX + px * CELL + CELL / 2, BY + py * CELL + CELL / 2]);
+  }
+  return pts;
+}
+
+function drawSnake(s, alpha, t) {
+  const pts = snakePoints(s, alpha);
+  if (!pts.length) return;
+  const color = s.alive ? s.color : shade(s.color, 0.5);
+  const bodyW = CELL * 0.78;
+
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+
+  ctx.strokeStyle = shade(color, 0.42);
+  ctx.lineWidth = bodyW + 6;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.stroke();
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = bodyW;
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.stroke();
+
+  const hx = pts[0][0], hy = pts[0][1];
+  const headR = bodyW * 0.7;
+  ctx.fillStyle = shade(color, 0.42);
+  ctx.beginPath(); ctx.arc(hx, hy, headR + 2, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = shade(color, 1.08);
+  ctx.beginPath(); ctx.arc(hx, hy, headR, 0, Math.PI * 2); ctx.fill();
+
+  const dx = s.dir[0], dy = s.dir[1];
+  const px = -dy, py = dx;
+  for (let side = -1; side <= 1; side += 2) {
+    const ex = hx + dx * headR * 0.28 + px * side * headR * 0.44;
+    const ey = hy + dy * headR * 0.28 + py * side * headR * 0.44;
+    ctx.fillStyle = COL.snow;
+    ctx.beginPath(); ctx.arc(ex, ey, headR * 0.33, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#1a1512';
+    ctx.beginPath(); ctx.arc(ex + dx * headR * 0.14, ey + dy * headR * 0.14, headR * 0.17, 0, Math.PI * 2); ctx.fill();
+  }
+
+  if (s.alive && Math.sin(t * 6) > 0.75) {
+    const tx = hx + dx * headR * 1.35, ty = hy + dy * headR * 1.35;
+    ctx.strokeStyle = '#dc4650';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(hx + dx * headR, hy + dy * headR);
+    ctx.lineTo(tx, ty);
+    ctx.moveTo(tx, ty); ctx.lineTo(tx + px * 3 - dx, ty + py * 3 - dy);
+    ctx.moveTo(tx, ty); ctx.lineTo(tx - px * 3 - dx, ty - py * 3 - dy);
+    ctx.stroke();
+  }
+}
+
+/* ---------- рисование: панели ---------- */
+function panel(x, y, w, h) {
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.55)';
+  ctx.shadowBlur = 18;
+  ctx.shadowOffsetY = 6;
+  rrect(x, y, w, h, 14);
+  ctx.fillStyle = COL.panel;
+  ctx.fill();
+  ctx.restore();
+  rrect(x, y, w, h, 14);
+  ctx.strokeStyle = COL.panelEdge;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+function buttonRect(label) {
+  return state.buttons[label] || null;
+}
+
+/* ---------- рисование: меню ---------- */
+function drawMenu(t) {
+  ctx.drawImage(bgCanvas, 0, 0);
+
+  text('ЧЕКУШКА', 72, 44, 76, COL.gold, true);
+  ctx.save();
+  ctx.globalAlpha = 0.9;
+  let x = 76;
+  'ЗМЕЙКА'.split('').forEach(function (ch) {
+    text(ch, x, 140, 22, COL.text, false);
+    x += ctx.measureText(ch).width + 9;
+  });
+  ctx.restore();
+
+  ctx.strokeStyle = COL.goldDark;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(76, 172); ctx.lineTo(226, 172); ctx.stroke();
+  text('0,5 литра азарта', 76, 182, 15, COL.faint, false);
+
+  state.buttons = {};
+  const items = state.menuItems;
+  for (let i = 0; i < items.length; i++) {
+    const y = 246 + i * 60;
+    const r = { x: 72, y: y, w: 348, h: 52 };
+    state.buttons['menu' + i] = r;
+    const active = i === state.menuIndex;
+    if (active) {
+      const g = ctx.createRadialGradient(r.x + 60, r.y + r.h / 2, 10, r.x + 60, r.y + r.h / 2, 260);
+      g.addColorStop(0, 'rgba(233,181,86,0.22)');
+      g.addColorStop(1, 'rgba(233,181,86,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(r.x - 120, r.y - 40, 520, r.h + 80);
+    }
+    rrect(r.x, r.y, r.w, r.h, 12);
+    ctx.fillStyle = active ? '#2c221a' : '#1c1613';
+    ctx.fill();
+    ctx.strokeStyle = active ? COL.gold : '#342920';
+    ctx.lineWidth = active ? 2 : 1;
+    ctx.stroke();
+    text(items[i], r.x + 24, r.y + r.h / 2 - 12, 24, active ? COL.gold : COL.dim, true);
+    if (active) bottle(r.x + r.w - 30, r.y + r.h / 2 + 2, 30, false, t);
+  }
+
+  const pts = [];
+  for (let i = 0; i < 30; i++) {
+    const a = -t * 0.9 + i * 0.095;
+    const rx = 208 + 24 * Math.sin(a * 1.7 + 1.2);
+    const ry = 176 + 20 * Math.cos(a * 1.3);
+    pts.push([856 + Math.cos(a) * rx, 352 + Math.sin(a) * ry]);
+  }
+  ctx.strokeStyle = shade(COL.p1, 0.45);
+  ctx.lineWidth = 12;
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.stroke();
+
+  bottle(856, 352, 330, false, t);
+
+  centerText('РЕКОРД', 856, 542, 16, COL.faint, false);
+  centerText(String(state.best), 856, 566, 22, COL.gold, true);
+
+  text('выбор: ↑↓ / тап', 24, H - 34, 14, COL.faint, false);
+  text('v1.0 · HTML', W - 22, H - 26, 13, COL.faint, false);
+}
+
+/* ---------- рисование: справка ---------- */
+const HELP = [
+  ['Цель', 'Собирать чекушки и не врезаться: в стену, в себя или в соперника.'],
+  ['Чекушка', '+1 очко и +1 сегмент. Золотая — +3 очка и +2 сегмента.'],
+  ['Темп', 'С каждой чекушкой змейка быстрее, до 15 клеток в секунду.'],
+  ['Один', 'Стрелки, WASD, свайп или джойстик. Рекорд сохраняется.'],
+  ['Вдвоём', 'Игрок 1 — стрелки/левый джойстик, Игрок 2 — WASD/правый.'],
+  ['Пауза', 'Esc или кнопка II. Пробел — дальше после раунда.']
+];
+
+function drawHelp() {
+  ctx.drawImage(bgCanvas, 0, 0);
+  text('КАК ИГРАТЬ', 72, 50, 56, COL.gold, true);
+  panel(72, 150, 1020, 470);
+  let y = 178;
+  for (let i = 0; i < HELP.length; i++) {
+    text(HELP[i][0], 102, y, 17, COL.gold, true);
+    text(HELP[i][1], 242, y, 17, COL.text, false);
+    y += 66;
+    ctx.strokeStyle = 'rgba(58,48,40,0.8)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(102, y - 26); ctx.lineTo(1062, y - 26); ctx.stroke();
+  }
+  bottle(1010, 260, 190, true, state.t);
+  text('Esc / тап — назад', 24, H - 34, 14, COL.faint, false);
+}
+
+/* ---------- рисование: игра ---------- */
+function drawHeader(m) {
+  text('ЧЕКУШКА', PAD, 20, 19, COL.gold, true);
+  text('ЗМЕЙКА', PAD + 2, 46, 14, COL.faint, false);
+  text(m.mode === 'solo' ? 'один' : 'вдвоём', PAD, 64, 14, COL.dim, false);
+
+  if (m.mode === 'solo') {
+    text('РЕКОРД', W - PAD, 20, 13, COL.faint, false, 'right');
+    text(String(state.best), W - PAD, 36, 26, COL.dim, true, 'right');
+  } else {
+    const right = W - PAD;
+    text(String(m.wins[0]), right - 118, 34, 40, COL.p1, true, 'right');
+    text('Игрок 1', right - 118, 66, 13, COL.faint, false, 'right');
+    text(':', right - 72, 34, 30, COL.faint, true, 'right');
+    text(String(m.wins[1]), right - 26, 34, 40, COL.p2, true, 'right');
+    text('Игрок 2', right - 26, 66, 13, COL.faint, false, 'right');
+  }
+
+  const pr = { x: BX + BW - 124, y: 22, w: 48, h: 40 };
+  state.buttons.pause = pr;
+  rrect(pr.x, pr.y, pr.w, pr.h, 10);
+  ctx.fillStyle = '#1c1613';
+  ctx.fill();
+  ctx.strokeStyle = COL.panelEdge;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  centerText('II', pr.x + pr.w / 2, pr.y + pr.h / 2, 18, COL.dim, true);
+}
+
+function drawBoard(m) {
+  const shake = m.shake;
+  const ox = shake ? (Math.random() - 0.5) * shake : 0;
+  const oy = shake ? (Math.random() - 0.5) * shake : 0;
+
+  ctx.save();
+  ctx.translate(ox, oy);
+
+  ctx.fillStyle = COL.board;
+  ctx.fillRect(BX, BY, BW, BH);
+
+  ctx.strokeStyle = COL.grid;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 1; x < COLS; x++) { ctx.moveTo(BX + x * CELL, BY); ctx.lineTo(BX + x * CELL, BY + BH); }
+  for (let y = 1; y < ROWS; y++) { ctx.moveTo(BX, BY + y * CELL); ctx.lineTo(BX + BW, BY + y * CELL); }
+  ctx.stroke();
+
+  ctx.strokeStyle = COL.goldDark;
+  ctx.lineWidth = 2;
+  const L = 16;
+  [[BX, BY, 1, 1], [BX + BW, BY, -1, 1], [BX, BY + BH, 1, -1], [BX + BW, BY + BH, -1, -1]].forEach(function (c) {
+    ctx.beginPath();
+    ctx.moveTo(c[0], c[1]); ctx.lineTo(c[0] + c[2] * L, c[1]);
+    ctx.moveTo(c[0], c[1]); ctx.lineTo(c[0], c[1] + c[3] * L);
+    ctx.stroke();
+  });
+
+  m.food.forEach(function (f) {
+    bottle(BX + f.x * CELL + CELL / 2, BY + f.y * CELL + CELL / 2 + 2, CELL * (f.dbl ? 1.46 : 1.34), f.dbl, state.t);
+  });
+
+  const ordered = m.snakes.slice().sort(function (a, b) { return (a.alive ? 1 : 0) - (b.alive ? 1 : 0); });
+  ordered.forEach(function (s) { drawSnake(s, m.status === 'playing' ? m.alpha : 1, state.t); });
+
+  m.parts.forEach(function (p) {
+    const k = clamp(p.life / p.max, 0, 1);
+    ctx.globalAlpha = k;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(BX + p.x * CELL, BY + p.y * CELL, p.size * k, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  m.floats.forEach(function (f) {
+    const k = clamp(f.life / f.max, 0, 1);
+    ctx.globalAlpha = k;
+    centerText(f.text, BX + f.x * CELL + CELL / 2, BY + f.y * CELL, 20, f.color, true);
+    ctx.globalAlpha = 1;
+  });
+
+  if (m.status === 'countdown' && !state.paused) {
+    ctx.fillStyle = 'rgba(8,6,5,0.28)';
+    ctx.fillRect(BX, BY, BW, BH);
+    const n = Math.max(1, Math.ceil(m.countdown));
+    centerText(String(n), BX + BW / 2, BY + BH / 2 - 10, 110, COL.gold, true);
+    centerText('ПРИГОТОВЬСЯ', BX + BW / 2, BY + BH / 2 + 80, 20, COL.dim, true);
+  }
+  ctx.restore();
+}
+
+function drawPanel(m) {
+  panel(PX, PY, PW, PH);
+  const x = PX + 24;
+
+  if (m.mode === 'solo') {
+    const s = m.snakes[0];
+    text('СЧЁТ', x, PY + 22, 13, COL.faint, false);
+    text(String(s.score), x - 4, PY + 30, 62, COL.gold, true);
+    ctx.strokeStyle = 'rgba(58,48,40,0.9)';
+    ctx.beginPath(); ctx.moveTo(x, PY + 208); ctx.lineTo(PX + PW - 24, PY + 208); ctx.stroke();
+
+    text('ВЫПИТО', x, PY + 224, 13, COL.faint, false);
+    text(String(s.drinks), x + 42, PY + 246, 32, COL.text, true);
+    bottle(x + 16, PY + 266, 46, false, state.t);
+    text((s.drinks * 0.5).toFixed(1).replace('.', ',') + ' промилле', x + 42, PY + 288, 15, COL.dim, false);
+
+    ctx.strokeStyle = 'rgba(58,48,40,0.9)';
+    ctx.beginPath(); ctx.moveTo(x, PY + 320); ctx.lineTo(PX + PW - 24, PY + 320); ctx.stroke();
+
+    text('ДЛИНА', x, PY + 336, 13, COL.faint, false);
+    text(String(s.cells.length), x, PY + 354, 30, COL.text, true);
+    text(s.alive ? 'в игре' : 'конец', x + 74, PY + 364, 14, s.alive ? COL.green : COL.red, false);
+    drawSpeed(m, PY + 404);
+  } else {
+    for (let i = 0; i < 2; i++) {
+      const cardY = PY + 16 + i * 120;
+      rrect(PX + 16, cardY, PW - 32, 108, 12);
+      ctx.fillStyle = '#201a16';
+      ctx.fill();
+      ctx.strokeStyle = '#3a2e24';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      const s = m.snakes[i];
+      const winColor = i === 0 ? COL.p1 : COL.p2;
+      text(s.name, PX + 32, cardY + 10, 16, winColor, true);
+      for (let k = 0; k < RULES.winsNeeded; k++) {
+        ctx.beginPath();
+        ctx.arc(PX + PW - 36 - (RULES.winsNeeded - 1 - k) * 20, cardY + 20, 6, 0, Math.PI * 2);
+        ctx.fillStyle = k < m.wins[i] ? winColor : '#3a3028';
+        ctx.fill();
+      }
+      text(String(s.score), PX + 30, cardY + 32, 40, COL.text, true);
+      text('длина ' + s.cells.length, PX + 32, cardY + 80, 14, COL.dim, false);
+      text('выпито ' + s.drinks, PX + PW - 32, cardY + 80, 14, COL.dim, false, 'right');
+    }
+    drawSpeed(m, PY + 296);
+    bottle(PX + PW - 72, PY + 402, 92, false, state.t + 0.6);
+  }
+
+  let hy = PY + PH - 96;
+  const hints = state.touch
+    ? ['джойстик внизу — руль', 'свайп по полю — поворот', 'II — пауза']
+    : (m.mode === 'solo' ? ['↑ ↓ ← → или WASD', 'Esc — пауза, M — звук']
+       : ['Игрок 1: стрелки', 'Игрок 2: WASD', 'Esc — пауза']);
+  hints.forEach(function (line) { text(line, x, hy, 14, COL.faint, false); hy += 24; });
+}
+
+function drawSpeed(m, top) {
+  const x = PX + 24, w = PW - 48;
+  text('ТЕМП', x, top, 13, COL.faint, false);
+  text(m.speed.toFixed(1).replace('.', ',') + ' кл/с', PX + PW - 24, top, 14, COL.dim, false, 'right');
+  const k = clamp((m.speed - RULES.soloSpeed) / (RULES.speedMax - RULES.soloSpeed), 0, 1);
+  rrect(x, top + 24, w, 10, 5);
+  ctx.fillStyle = '#2c241c';
+  ctx.fill();
+  rrect(x, top + 24, Math.max(8, w * k), 10, 5);
+  ctx.fillStyle = k > 0.6 ? COL.gold : COL.green;
+  ctx.fill();
+}
+
+function overlayCard(w, h) {
+  rrect(BX + BW / 2 - w / 2, BY + BH / 2 - h / 2, w, h, 16);
+  ctx.fillStyle = '#1e1815';
+  ctx.fill();
+  ctx.strokeStyle = '#4a3a2c';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  return { x: BX + BW / 2 - w / 2, y: BY + BH / 2 - h / 2, w: w, h: h };
+}
+
+function drawOverlay(m) {
+  ctx.fillStyle = 'rgba(8,6,5,0.5)';
+  ctx.fillRect(BX, BY, BW, BH);
+
+  state.buttons = state.buttons || {};
+
+  if (m.mode === 'solo') {
+    const c = overlayCard(560, 286);
+    text('Игра окончена', c.x + 28, c.y + 24, 26, COL.red, true);
+    text(String(m.snakes[0].score), c.x + 26, c.y + 60, 64, COL.gold, true);
+    text('рекорд: ' + state.best, c.x + 30, c.y + 138, 18, COL.dim, false);
+    const b1 = { x: c.x + 24, y: c.y + 190, w: 240, h: 54 };
+    const b2 = { x: c.x + 296, y: c.y + 190, w: 240, h: 54 };
+    state.buttons.again = b1;
+    state.buttons.menu = b2;
+    drawButton(b1, 'Заново', COL.gold);
+    drawButton(b2, 'В меню', COL.dim);
+    return;
+  }
+
+  const c = overlayCard(560, 286);
+  const win = m.winner;
+  const title = win === null ? 'Ничья' : m.snakes[win].name + ' побеждает';
+  const color = win === null ? COL.text : (win === 0 ? COL.p1 : COL.p2);
+  const reasons = { wall: 'врезался в стену', self: 'укусил сам себя', enemy: 'врезался в соперника', head: 'голова в голову' };
+  text(title, c.x + 28, c.y + 24, 28, color, true);
+  text(win === null ? 'обе змейки погибли' : (reasons[m.reason] || 'соперник не выжил'), c.x + 28, c.y + 64, 17, COL.dim, false);
+
+  for (let i = 0; i < 2; i++) {
+    const wx = c.x + 34 + i * 210;
+    text(m.snakes[i].name, wx, c.y + 108, 15, i === 0 ? COL.p1 : COL.p2, true);
+    for (let k = 0; k < RULES.winsNeeded; k++) {
+      ctx.beginPath();
+      ctx.arc(wx + 8 + k * 22, c.y + 136, 7, 0, Math.PI * 2);
+      ctx.fillStyle = k < m.wins[i] ? (i === 0 ? COL.p1 : COL.p2) : '#3a3028';
+      ctx.fill();
+    }
+  }
+
+  if (m.status === 'match_over') {
+    text('матч взят: ' + m.wins[0] + ' : ' + m.wins[1], c.x + 28, c.y + 168, 20, COL.gold, true);
+  } else {
+    text('следующий раунд через ' + Math.max(0, m.timer).toFixed(1).replace('.', ','), c.x + 28, c.y + 168, 17, COL.faint, false);
+  }
+
+  const b1 = { x: c.x + 24, y: c.y + 208, w: 240, h: 54 };
+  const b2 = { x: c.x + 296, y: c.y + 208, w: 240, h: 54 };
+  state.buttons.again = b1;
+  state.buttons.menu = b2;
+  drawButton(b1, m.status === 'match_over' ? 'Новая партия' : 'Дальше', COL.gold);
+  drawButton(b2, 'В меню', COL.dim);
+}
+
+function drawButton(r, label, color) {
+  rrect(r.x, r.y, r.w, r.h, 12);
+  ctx.fillStyle = color === COL.gold ? COL.gold : '#4a4038';
+  ctx.fill();
+  centerText(label, r.x + r.w / 2, r.y + r.h / 2, 20, '#181310', true);
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(8,6,5,0.62)';
+  ctx.fillRect(BX, BY, BW, BH);
+  const c = overlayCard(430, 230);
+  centerText('ПАУЗА', c.x + c.w / 2, c.y + 46, 34, COL.gold, true);
+  const b1 = { x: c.x + 24, y: c.y + 112, w: 180, h: 54 };
+  const b2 = { x: c.x + 226, y: c.y + 112, w: 180, h: 54 };
+  state.buttons.resume = b1;
+  state.buttons.menu = b2;
+  drawButton(b1, 'Продолжить', COL.gold);
+  drawButton(b2, 'В меню', COL.dim);
+}
+
+function drawPads(m) {
+  const pads = state.pads || [];
+  pads.forEach(function (pad) {
+    const r = pad.r;
+    ctx.fillStyle = 'rgba(12,10,9,0.45)';
+    ctx.beginPath(); ctx.arc(pad.x, pad.y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,100,80,0.55)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    const arrows = [
+      { a: 0, d: DIRS.right },
+      { a: Math.PI / 2, d: DIRS.up },
+      { a: Math.PI, d: DIRS.left },
+      { a: -Math.PI / 2, d: DIRS.down }
+    ];
+    arrows.forEach(function (arrow) {
+      const ang = arrow.a;
+      const col = pad.active === arrow.d ? pad.color : 'rgba(208,192,172,0.65)';
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.moveTo(pad.x + Math.cos(ang) * r * 0.8, pad.y - Math.sin(ang) * r * 0.8);
+      ctx.lineTo(pad.x + Math.cos(ang + 0.55) * r * 0.34, pad.y - Math.sin(ang + 0.55) * r * 0.34);
+      ctx.lineTo(pad.x + Math.cos(ang - 0.55) * r * 0.34, pad.y - Math.sin(ang - 0.55) * r * 0.34);
+      ctx.closePath();
+      ctx.fill();
+    });
+    if (pad.label) centerText(pad.label, pad.x, pad.y - r - 16, 14, pad.color, true);
+  });
+}
+
+/* ---------- сцены ---------- */
+function drawPlay(m) {
+  ctx.drawImage(bgCanvas, 0, 0);
+  drawHeader(m);
+  drawBoard(m);
+  drawPanel(m);
+  if (state.touch && !state.paused && (m.status === 'playing' || m.status === 'countdown')) drawPads(m);
+  if (state.paused) drawPause();
+  else if (m.status === 'round_over' || m.status === 'match_over') drawOverlay(m);
+}
+
+/* ---------- ввод ---------- */
+function toLogical(ev) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (ev.clientX - r.left) * W / r.width,
+    y: (ev.clientY - r.top) * H / r.height
+  };
+}
+
+function hit(rect, p) {
+  return rect && p.x >= rect.x && p.x <= rect.x + rect.w && p.y >= rect.y && p.y <= rect.y + rect.h;
+}
+
+function startGame(mode) {
+  state.match = newMatch(mode);
+  state.scene = 'play';
+  state.paused = false;
+  state.pads = [];
+  if (state.touch) {
+    const left = { x: BX + 100, y: BY + BH - 100, r: 66, color: COL.p1, label: mode === 'duo' ? '1' : '', active: null };
+    const right = { x: BX + BW - 100, y: BY + BH - 100, r: 66, color: mode === 'duo' ? COL.p2 : COL.p1, label: mode === 'duo' ? '2' : '', active: null };
+    state.pads = mode === 'duo' ? [left, right] : [right];
+  }
+}
+
+function turnPlayer(idx, dir) {
+  const m = state.match;
+  if (!m) return;
+  if (m.status !== 'playing' && m.status !== 'countdown') return;
+  if (idx >= m.snakes.length) return;
+  turnSnake(m.snakes[idx], dir);
+}
+
+function onKey(e) {
+  audioInit();
+  const code = e.code;
+  if (state.scene === 'menu') {
+    if (code === 'ArrowUp' || code === 'KeyW') { state.menuIndex = (state.menuIndex + state.menuItems.length - 1) % state.menuItems.length; sfx.click(); e.preventDefault(); }
+    if (code === 'ArrowDown' || code === 'KeyS') { state.menuIndex = (state.menuIndex + 1) % state.menuItems.length; sfx.click(); e.preventDefault(); }
+    if (code === 'Enter' || code === 'Space') { menuPick(state.menuIndex); e.preventDefault(); }
+    return;
+  }
+  if (state.scene === 'help') {
+    if (code === 'Escape' || code === 'Enter' || code === 'Space') { state.scene = 'menu'; sfx.click(); }
+    return;
+  }
+  const m = state.match;
+  if (!m) return;
+
+  if (code === 'Escape') {
+    if (m.status === 'round_over' || m.status === 'match_over') { state.scene = 'menu'; }
+    else state.paused = !state.paused;
+    return;
+  }
+  if (code === 'KeyM') { soundOn = !soundOn; state.menuItems[3] = 'Звук: ' + (soundOn ? 'вкл' : 'выкл'); return; }
+  if (code === 'KeyR' && m.status === 'playing') { startRound(m); return; }
+  if (state.paused) { if (code === 'Space' || code === 'Enter') state.paused = false; return; }
+
+  if (code === 'Space' || code === 'Enter') {
+    if (m.status === 'round_over') startRound(m);
+    else if (m.status === 'match_over') { m.wins = [0, 0]; startRound(m); }
+    return;
+  }
+
+  const d = KEYS[code];
+  if (!d) return;
+  e.preventDefault();
+  const dir = DIRS[d];
+  if (m.mode === 'solo') turnPlayer(0, dir);
+  else if (m.mode === 'duo') turnPlayer((code === 'KeyW' || code === 'KeyA' || code === 'KeyS' || code === 'KeyD') ? 1 : 0, dir);
+}
+
+function menuPick(i) {
+  if (i === 0) startGame('solo');
+  else if (i === 1) startGame('duo');
+  else if (i === 2) { state.scene = 'help'; sfx.click(); }
+  else if (i === 3) {
+    soundOn = !soundOn;
+    state.menuItems[3] = 'Звук: ' + (soundOn ? 'вкл' : 'выкл');
+    sfx.click();
+  }
+}
+
+let pointerStart = null;
+
+function onPointerDown(e) {
+  audioInit();
+  e.preventDefault();
+  const p = toLogical(e);
+  const m = state.match;
+
+  if (state.scene === 'menu') {
+    for (let i = 0; i < state.menuItems.length; i++) {
+      if (hit(state.buttons['menu' + i], p)) { state.menuIndex = i; menuPick(i); return; }
+    }
+    return;
+  }
+  if (state.scene === 'help') { state.scene = 'menu'; sfx.click(); return; }
+  if (!m) return;
+
+  if (state.paused) {
+    if (hit(state.buttons.resume, p)) { state.paused = false; return; }
+    if (hit(state.buttons.menu, p)) { state.scene = 'menu'; state.paused = false; return; }
+    return;
+  }
+
+  if (m.status === 'round_over' || m.status === 'match_over') {
+    if (hit(state.buttons.again, p)) {
+      if (m.status === 'match_over') { m.wins = [0, 0]; }
+      startRound(m);
+      return;
+    }
+    if (hit(state.buttons.menu, p)) { state.scene = 'menu'; return; }
+    return;
+  }
+
+  if (hit(state.buttons.pause, p)) { state.paused = true; sfx.click(); return; }
+
+  if (state.touch) {
+    for (let i = 0; i < (state.pads || []).length; i++) {
+      const pad = state.pads[i];
+      const dx = p.x - pad.x, dy = p.y - pad.y;
+      if (Math.hypot(dx, dy) <= pad.r * 1.25) {
+        let dir;
+        if (Math.abs(dx) > Math.abs(dy)) dir = dx > 0 ? DIRS.right : DIRS.left;
+        else dir = dy > 0 ? DIRS.down : DIRS.up;
+        pad.active = dir;
+        turnPlayer(state.pads.length === 2 ? i : 0, dir);
+        return;
+      }
+    }
+    pointerStart = p;
+  }
+}
+
+function onPointerMove(e) {
+  if (!pointerStart) return;
+  const p = toLogical(e);
+  const dx = p.x - pointerStart.x, dy = p.y - pointerStart.y;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) > 34) {
+    const player = (state.match && state.match.mode === 'duo' && p.x > BX + BW / 2) ? 1 : 0;
+    if (Math.abs(dx) > Math.abs(dy)) turnPlayer(player, dx > 0 ? DIRS.right : DIRS.left);
+    else turnPlayer(player, dy > 0 ? DIRS.down : DIRS.up);
+    pointerStart = p;
+  }
+}
+
+function onPointerUp(e) {
+  pointerStart = null;
+  (state.pads || []).forEach(function (p) { p.active = null; });
+}
+
+document.addEventListener('keydown', onKey);
+canvas.addEventListener('pointerdown', onPointerDown);
+canvas.addEventListener('pointermove', onPointerMove);
+canvas.addEventListener('pointerup', onPointerUp);
+canvas.addEventListener('pointercancel', onPointerUp);
+
+/* ---------- предохранитель: показать ошибку на экране ---------- */
+window.addEventListener('error', function (e) {
+  state.fatal = (e.message || 'ошибка') + '  [' + (e.filename || '').split('/').pop() + ':' + e.lineno + ']';
+});
+
+/* ---------- главный цикл ---------- */
+let last = performance.now();
+function frame(now) {
+  try {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    state.t += dt;
+
+    if (state.scene === 'play' && state.match) {
+      if (!state.paused) updateMatch(state.match, dt);
+      drawPlay(state.match);
+    } else if (state.scene === 'help') {
+      drawHelp();
+    } else {
+      drawMenu(state.t);
+    }
+
+    if (state.fatal) {
+      ctx.fillStyle = 'rgba(120,20,20,0.92)';
+      ctx.fillRect(0, 0, W, 90);
+      ctx.fillStyle = '#fff';
+      ctx.font = font(20, true);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      const words = String(state.fatal).split(' ');
+      ctx.fillText(words.slice(0, 12).join(' '), 20, 20);
+      ctx.fillText(words.slice(12, 24).join(' '), 20, 50);
+    }
+  } catch (err) {
+    state.fatal = 'СБОЙ: ' + err.message;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
